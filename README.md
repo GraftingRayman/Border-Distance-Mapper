@@ -8,4 +8,4 @@ Need to add distance from city itself
 
 Notes:
 
-First run will take 2-5 minutes, it downloads to cache data from streetmap, once the download is complete all future runs will use the cache until it is deleted or cleared
+First run will take 2-5 minutes, it downloads to cache data from streetmap, once the download is complete all future runs will use the cache until it is deleted or cleared using force_refresh = true
