@@ -70,8 +70,8 @@ class BorderDistanceMapper:
             }
         }
     
-    RETURN_TYPES = ("IMAGE", "IMAGE")
-    RETURN_NAMES = ("world_map", "buffer_mask")
+    RETURN_TYPES = ("IMAGE", "IMAGE", "IMAGE", "IMAGE")
+    RETURN_NAMES = ("world_map", "buffer_mask", "city_map", "city_buffer_mask")
     FUNCTION = "draw_border_buffer"
     CATEGORY = "image/mapping"
     
@@ -111,6 +111,28 @@ class BorderDistanceMapper:
             print(f"World map saved to cache: {cache_file}")
         except Exception as e:
             print(f"Warning: Could not save world map to cache: {e}")
+    
+    def get_city_coordinates(self, city_name):
+        """Get city coordinates using Nominatim API"""
+        try:
+            url = f"https://nominatim.openstreetmap.org/search"
+            params = {
+                'q': city_name,
+                'format': 'json',
+                'limit': 1
+            }
+            headers = {'User-Agent': 'ComfyUI-BorderDistance/1.0'}
+            
+            response = requests.get(url, params=params, headers=headers, timeout=10)
+            data = response.json()
+            
+            if data:
+                lat = float(data[0]['lat'])
+                lon = float(data[0]['lon'])
+                return lat, lon
+        except Exception as e:
+            print(f"Error getting city coordinates: {e}")
+            return None, None
     
     def get_country_from_city(self, city_name):
         """Get country code from city name using Nominatim API"""
@@ -303,6 +325,33 @@ class BorderDistanceMapper:
             
         except Exception as e:
             print(f"Error creating buffer: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    def create_city_buffer(self, city_lat, city_lon, distance_km):
+        """Create a circular buffer around city center"""
+        try:
+            # Create a point for the city
+            city_point = Point(city_lon, city_lat)
+            
+            # Buffer distance in degrees (approximate)
+            buffer_deg = distance_km / 111.0
+            
+            print(f"Creating city buffer with {buffer_deg:.6f} degree radius...")
+            
+            # Create circular buffer
+            buffered = city_point.buffer(buffer_deg, resolution=32)
+            
+            if buffered.is_empty:
+                print("City buffer created empty polygon")
+                return None
+                
+            print("City buffer created successfully")
+            return buffered
+            
+        except Exception as e:
+            print(f"Error creating city buffer: {e}")
             import traceback
             traceback.print_exc()
             return None
@@ -569,6 +618,60 @@ class BorderDistanceMapper:
         
         return img
     
+    def create_city_buffer_mask(self, city_lat, city_lon, city_buffered_polygon, image_width, image_height, outline_color):
+        """Create a transparent image with just the city buffer"""
+        # Create transparent image
+        img = Image.new('RGBA', (image_width, image_height), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        
+        # Color mapping for RGBA
+        colors = {
+            "red": (255, 0, 0, 255),
+            "blue": (0, 0, 255, 255),
+            "green": (0, 200, 0, 255),
+            "yellow": (255, 255, 0, 255),
+            "white": (255, 255, 255, 255),
+            "black": (0, 0, 0, 255),
+            "orange": (255, 140, 0, 255)
+        }
+        
+        color = colors[outline_color]
+        
+        # Draw city center marker
+        city_x, city_y = self.lat_lon_to_world_pixels(city_lat, city_lon, image_width, image_height)
+        marker_size = 8
+        draw.ellipse([city_x - marker_size, city_y - marker_size, 
+                     city_x + marker_size, city_y + marker_size], 
+                    fill=(255, 0, 0, 255), outline=(255, 255, 255, 255), width=2)
+        
+        if city_buffered_polygon:
+            # Draw buffer outline
+            if isinstance(city_buffered_polygon, MultiPolygon):
+                polygons = list(city_buffered_polygon.geoms)
+            else:
+                polygons = [city_buffered_polygon]
+            
+            for poly in polygons:
+                try:
+                    exterior_coords = list(poly.exterior.coords)
+                    buffer_pixels = []
+                    for lon, lat in exterior_coords:
+                        x, y = self.lat_lon_to_world_pixels(lat, lon, image_width, image_height)
+                        buffer_pixels.append((x, y))
+                    
+                    if len(buffer_pixels) > 2:
+                        for i in range(len(buffer_pixels) - 1):
+                            draw.line([buffer_pixels[i], buffer_pixels[i+1]], 
+                                     fill=color, width=4)
+                        draw.line([buffer_pixels[-1], buffer_pixels[0]], 
+                                 fill=color, width=4)
+                            
+                except Exception as e:
+                    print(f"Error drawing city buffer in mask: {e}")
+                    continue
+        
+        return img
+    
     def draw_border_buffer(self, city_name, distance_km, image_width, image_height, 
                            outline_color, show_country, map_style, detail_level, force_refresh):
         """Main function - uses cached world maps for performance"""
@@ -587,6 +690,15 @@ class BorderDistanceMapper:
             "black": (0, 0, 0),
             "orange": (255, 140, 0)
         }
+        
+        # Get city coordinates
+        print(f"Looking up coordinates for city: {city_name}")
+        city_lat, city_lon = self.get_city_coordinates(city_name)
+        
+        if city_lat is None or city_lon is None:
+            return self.create_error_outputs(image_width, image_height, f"Could not find coordinates for: {city_name}")
+        
+        print(f"City coordinates: {city_lat}, {city_lon}")
         
         # Get country from city
         print(f"Looking up country for city: {city_name}")
@@ -613,6 +725,10 @@ class BorderDistanceMapper:
         print("Loading world map base...")
         world_map_img, world_map_draw = self.get_world_map_base(image_width, image_height, map_style, detail_level, force_refresh)
         
+        # Create city map (copy of world map)
+        city_map_img = world_map_img.copy()
+        city_map_draw = ImageDraw.Draw(city_map_img)
+        
         # Get country border points
         all_countries = self.get_all_countries()
         border_points = all_countries.get(country_code, [])
@@ -632,26 +748,43 @@ class BorderDistanceMapper:
             mask_draw.text((50, 50), f"No data: {country_code}", fill=(255, 0, 0, 255))
             mask_array = np.array(mask_error).astype(np.float32) / 255.0
             
-            return (torch.from_numpy(img_array)[None,], torch.from_numpy(mask_array)[None,])
+            return (torch.from_numpy(img_array)[None,], torch.from_numpy(mask_array)[None,],
+                    torch.from_numpy(img_array)[None,], torch.from_numpy(mask_array)[None,])
         
         print(f"Found {len(border_points)} border points for {country_code}")
         
-        # Create buffer polygon
-        print("Creating buffer zone...")
+        # Create country buffer polygon
+        print("Creating country buffer zone...")
         buffered_polygon = self.create_buffer_polygon(border_points, distance_km)
         
-        # Create buffer mask
-        print("Creating buffer mask...")
+        # Create city buffer polygon
+        print("Creating city buffer zone...")
+        city_buffered_polygon = self.create_city_buffer(city_lat, city_lon, distance_km)
+        
+        # Create buffer mask (country-based)
+        print("Creating country buffer mask...")
         buffer_mask = self.create_buffer_mask(border_points, buffered_polygon, image_width, image_height, outline_color, show_country)
         
-        # Draw buffer and country on world map
+        # Create city buffer mask
+        print("Creating city buffer mask...")
+        city_buffer_mask = self.create_city_buffer_mask(city_lat, city_lon, city_buffered_polygon, image_width, image_height, outline_color)
+        
+        # Draw buffer and country on world map (country-based)
         print("Drawing overlay on world map...")
         self.draw_overlay_on_world_map(world_map_draw, border_points, buffered_polygon, colors[outline_color], show_country, distance_km)
         
-        # Add title
+        # Draw city buffer on city map
+        print("Drawing city overlay on city map...")
+        self.draw_city_overlay_on_map(city_map_draw, city_lat, city_lon, city_buffered_polygon, colors[outline_color], distance_km)
+        
+        # Add title to world map
         title_color = (0, 0, 0) if map_style != "minimal" else (100, 100, 100)
-        world_map_draw.text((20, 20), f"{city_name.title()} ({country_code})", fill=title_color)
+        world_map_draw.text((20, 20), f"{city_name.title()} ({country_code}) - Country Buffer", fill=title_color)
         world_map_draw.text((20, 45), f"{distance_km}km buffer zone", fill=title_color)
+        
+        # Add title to city map
+        city_map_draw.text((20, 20), f"{city_name.title()} - City Center Buffer", fill=title_color)
+        city_map_draw.text((20, 45), f"{distance_km}km radius from city center", fill=title_color)
         
         # Convert to tensors
         img_array = np.array(world_map_img).astype(np.float32) / 255.0
@@ -660,8 +793,50 @@ class BorderDistanceMapper:
         mask_array = np.array(buffer_mask).astype(np.float32) / 255.0
         mask_tensor = torch.from_numpy(mask_array)[None,]
         
+        city_img_array = np.array(city_map_img).astype(np.float32) / 255.0
+        city_img_tensor = torch.from_numpy(city_img_array)[None,]
+        
+        city_mask_array = np.array(city_buffer_mask).astype(np.float32) / 255.0
+        city_mask_tensor = torch.from_numpy(city_mask_array)[None,]
+        
         print("=== Generation Complete ===")
-        return (img_tensor, mask_tensor)
+        return (img_tensor, mask_tensor, city_img_tensor, city_mask_tensor)
+    
+    def draw_city_overlay_on_map(self, draw, city_lat, city_lon, city_buffered_polygon, color, distance_km):
+        """Draw city buffer overlay on map"""
+        width, height = draw.im.size
+        
+        # Draw city center marker
+        city_x, city_y = self.lat_lon_to_world_pixels(city_lat, city_lon, width, height)
+        marker_size = 10
+        draw.ellipse([city_x - marker_size, city_y - marker_size, 
+                     city_x + marker_size, city_y + marker_size], 
+                    fill=(255, 0, 0), outline=(255, 255, 255), width=3)
+        
+        if city_buffered_polygon:
+            # Draw buffer outline
+            if isinstance(city_buffered_polygon, MultiPolygon):
+                polygons = list(city_buffered_polygon.geoms)
+            else:
+                polygons = [city_buffered_polygon]
+            
+            for poly in polygons:
+                try:
+                    exterior_coords = list(poly.exterior.coords)
+                    buffer_pixels = []
+                    for lon, lat in exterior_coords:
+                        x, y = self.lat_lon_to_world_pixels(lat, lon, width, height)
+                        buffer_pixels.append((x, y))
+                    
+                    if len(buffer_pixels) > 2:
+                        for i in range(len(buffer_pixels) - 1):
+                            draw.line([buffer_pixels[i], buffer_pixels[i+1]], 
+                                     fill=color, width=4)
+                        draw.line([buffer_pixels[-1], buffer_pixels[0]], 
+                                 fill=color, width=4)
+                    
+                except Exception as e:
+                    print(f"Error drawing city buffer overlay: {e}")
     
     def draw_overlay_on_world_map(self, draw, border_points, buffered_polygon, color, show_country, distance_km):
         """Draw buffer and country overlay on existing world map"""
@@ -709,7 +884,7 @@ class BorderDistanceMapper:
                     print(f"Error drawing buffer overlay: {e}")
     
     def create_error_outputs(self, image_width, image_height, error_message):
-        """Create error outputs for both world map and buffer mask"""
+        """Create error outputs for all return types"""
         img_error = Image.new('RGB', (image_width, image_height), color=(50, 50, 50))
         draw_error = ImageDraw.Draw(img_error)
         draw_error.text((50, 50), error_message, fill=(255, 255, 255))
@@ -720,7 +895,8 @@ class BorderDistanceMapper:
         mask_draw.text((50, 50), error_message, fill=(255, 0, 0, 255))
         mask_array = np.array(mask_error).astype(np.float32) / 255.0
         
-        return (torch.from_numpy(img_array)[None,], torch.from_numpy(mask_array)[None,])
+        return (torch.from_numpy(img_array)[None,], torch.from_numpy(mask_array)[None,],
+                torch.from_numpy(img_array)[None,], torch.from_numpy(mask_array)[None,])
 
 
 NODE_CLASS_MAPPINGS = {
